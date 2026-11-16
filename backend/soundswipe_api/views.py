@@ -45,7 +45,8 @@ def register_user(request):
     return Response({
         'user_id': user.id,
         'username': user.username,
-        'role': profile.role
+        'role': profile.role,
+        'feedback_token': signing.dumps(user.id, salt='feedback-api'),
     }, status=status.HTTP_201_CREATED)
 
 @api_view(['POST'])
@@ -231,7 +232,7 @@ def track_feedback(request, track_id):
     return Response({
         'feedback_count': len(comments),
         'max_listeners': track.max_listeners,
-        'can_unlock': len(comments) >= track.max_listeners,
+        'can_unlock': any(comment['chat_message_id'] is None for comment in comments),
         'comments': [
             {'id': comment['id'], 'unlocked': comment['chat_message_id'] is not None}
             for comment in comments
@@ -249,8 +250,6 @@ def unlock_feedback(request, feedback_id):
     track = feedback.track
     if track.uploader_id != user.id:
         return Response({'error': 'Only the track creator can unlock feedback'}, status=403)
-    if track.feedbacks.count() < track.max_listeners:
-        return Response({'error': 'The track has not reached its feedback target'}, status=409)
     if request.data.get('confirm') is not True:
         return Response({'error': 'Payment confirmation is required'}, status=400)
 

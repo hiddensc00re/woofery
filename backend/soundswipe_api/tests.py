@@ -86,34 +86,38 @@ class SoundSwipeAPITests(APITestCase):
             summary = self.client.get(summary_url, **creator_headers)
             self.assertEqual(summary.status_code, 200)
             self.assertEqual(summary.data['feedback_count'], number)
-            self.assertEqual(summary.data['can_unlock'], number == 5)
+            self.assertTrue(summary.data['can_unlock'])
             self.assertEqual(summary.data['comments'], [
-                {'id': feedback_id, 'unlocked': False} for feedback_id in feedback_ids
+                {'id': feedback_id, 'unlocked': index == 0 and number > 1}
+                for index, feedback_id in enumerate(feedback_ids)
             ])
-            self.assertEqual(self.client.get(reverse('chats'), **chat_headers).data, [])
-            self.assertEqual(ChatMessage.objects.count(), 0)
-            if number == 1:
-                early = self.client.post(
-                    reverse('unlock_feedback', args=[feedback_ids[0]]),
-                    {'confirm': True}, format='json', **creator_headers,
-                )
-                self.assertEqual(early.status_code, 409)
+            chats = self.client.get(reverse('chats'), **chat_headers).data
+            self.assertEqual([room['last_message'] for room in chats],
+                [] if number == 1 else ['Private comment 1'])
+            self.assertEqual(ChatMessage.objects.count(), 0 if number == 1 else 1)
+            if number != 1:
+                continue
 
-        unlock_url = reverse('unlock_feedback', args=[feedback_ids[0]])
-        self.assertEqual(self.client.post(unlock_url, {'confirm': True},
-            format='json', **listener_headers).status_code, 403)
-        self.assertEqual(self.client.post(unlock_url, {'confirm': True},
-            format='json', **chat_headers).status_code, 401)
-        self.assertEqual(self.client.post(unlock_url, {'confirm': False},
-            format='json', **creator_headers).status_code, 400)
+            unlock_url = reverse('unlock_feedback', args=[feedback_ids[0]])
+            self.assertEqual(self.client.post(unlock_url, {'confirm': True},
+                format='json', **listener_headers).status_code, 403)
+            self.assertEqual(self.client.post(unlock_url, {'confirm': True},
+                format='json', **chat_headers).status_code, 401)
+            self.assertEqual(self.client.post(unlock_url, {'confirm': False},
+                format='json', **creator_headers).status_code, 400)
 
-        unlocked = self.client.post(unlock_url, {'confirm': True},
-            format='json', **creator_headers)
-        self.assertEqual(unlocked.status_code, 200)
-        self.assertEqual(unlocked.data['payment'], {
-            'simulated': True, 'amount_cents': 499, 'currency': 'EUR',
-        })
-        self.assertFalse(unlocked.data['already_unlocked'])
+            unlocked = self.client.post(unlock_url, {'confirm': True},
+                format='json', **creator_headers)
+            self.assertEqual(unlocked.status_code, 200)
+            self.assertEqual(unlocked.data['payment'], {
+                'simulated': True, 'amount_cents': 499, 'currency': 'EUR',
+            })
+            self.assertFalse(unlocked.data['already_unlocked'])
+            self.track.refresh_from_db()
+            self.assertTrue(self.track.is_active)
+
+        self.track.refresh_from_db()
+        self.assertFalse(self.track.is_active)
         repeated = self.client.post(unlock_url, {'confirm': True},
             format='json', **creator_headers)
         self.assertEqual(repeated.status_code, 200)

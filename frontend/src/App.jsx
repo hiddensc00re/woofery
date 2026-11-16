@@ -16,7 +16,7 @@ function App() {
   });
   
   // UI Navigation
-  const [currentTab, setCurrentTab] = useState('swipe'); // 'swipe', 'saved', 'chats', 'upload'
+  const [currentTab, setCurrentTab] = useState('swipe');
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [authMode, setAuthMode] = useState('login'); // 'login' or 'register'
   
@@ -32,11 +32,15 @@ function App() {
   const [commentingTrack, setCommentingTrack] = useState(null);
   const [feedbackComment, setFeedbackComment] = useState('');
   
-  // Mock Payment Flow
-  const [showPayment, setShowPayment] = useState(false);
-  const [paymentStep, setPaymentStep] = useState('checkout'); // 'checkout', 'processing', 'success'
-  const [pendingFeedback, setPendingFeedback] = useState(null); // stores track_id and comment before payment
-  
+  const [submittingFeedback, setSubmittingFeedback] = useState(false);
+  const [feedbackError, setFeedbackError] = useState('');
+  const [creatorTracks, setCreatorTracks] = useState([]);
+  const [creatorFeedbackError, setCreatorFeedbackError] = useState('');
+  const [loadingCreatorFeedback, setLoadingCreatorFeedback] = useState(false);
+  const [selectedFeedback, setSelectedFeedback] = useState(null);
+  const [unlockingFeedback, setUnlockingFeedback] = useState(false);
+  const [unlockError, setUnlockError] = useState('');
+
   // Audio Player State (Global instance)
   const [playingTrackId, setPlayingTrackId] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -83,6 +87,9 @@ function App() {
     const headers = { 'Content-Type': 'application/json' };
     if (user) {
       headers['X-User-ID'] = String(user.user_id);
+      if (user.feedback_token) {
+        headers.Authorization = `Bearer ${user.feedback_token}`;
+      }
     }
     return headers;
   };
@@ -102,6 +109,12 @@ function App() {
     setIsPlaying(false);
     setPlayingTrackId(null);
   }, [user]);
+
+  useEffect(() => {
+    if (currentTab === 'feedback' && user?.role === 'creator') {
+      fetchCreatorFeedback();
+    }
+  }, [currentTab, user]);
 
   // Audio update listeners
   useEffect(() => {
@@ -226,6 +239,10 @@ function App() {
     setCurrentTab('swipe');
     setActiveRoomId(null);
     setActiveRoom(null);
+    setCreatorTracks([]);
+    setSelectedFeedback(null);
+    setCommentingTrack(null);
+    setFeedbackComment('');
   };
 
   // Handle drag/swipe mechanics
@@ -286,6 +303,7 @@ function App() {
       return;
     }
     const currentTrack = deck[currentCardIndex];
+    setFeedbackError('');
     setCommentingTrack(currentTrack);
     setDragOffset({ x: 0, y: 0 });
     setSwipeDirection(null);
@@ -301,50 +319,82 @@ function App() {
     setCurrentCardIndex((prev) => prev + 1);
   };
 
-  // Submit Feedback & Mock Payment trigger
-  const handleFeedbackSubmit = () => {
-    if (!feedbackComment.trim()) return;
-    
-    // Save pending feedback and trigger payment modal
-    setPendingFeedback({
-      track_id: commentingTrack.id,
-      comment: feedbackComment
-    });
-    setCommentingTrack(null);
-    setFeedbackComment('');
-    setPaymentStep('checkout');
-    setShowPayment(true);
+  const handleFeedbackSubmit = async () => {
+    const comment = feedbackComment.trim();
+    if (!comment || submittingFeedback) return;
+    setSubmittingFeedback(true);
+    setFeedbackError('');
+
+    try {
+      const res = await fetch(`${API_BASE}/feedback/`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({ track_id: commentingTrack.id, comment })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not submit feedback');
+
+      setCommentingTrack(null);
+      setFeedbackComment('');
+      fetchDeck();
+      fetchSavedTracks();
+    } catch (error) {
+      setFeedbackError(error.message);
+    } finally {
+      setSubmittingFeedback(false);
+    }
   };
 
-  // Complete Payment Mock
-  const processMockPayment = async () => {
-    setPaymentStep('processing');
-    
-    // Simulate API delay
-    setTimeout(async () => {
-      try {
-        const res = await fetch(`${API_BASE}/feedback/`, {
-          method: 'POST',
-          headers: getHeaders(),
-          body: JSON.stringify(pendingFeedback)
-        });
-        
-        if (res.ok) {
-          const data = await res.json();
-          setPaymentStep('success');
-          // Refresh deck and chats
-          fetchDeck();
-          fetchChats();
-        } else {
-          alert('Failed to submit feedback API error');
-          setShowPayment(false);
-        }
-      } catch (err) {
-        console.error(err);
-        alert('API error');
-        setShowPayment(false);
-      }
-    }, 2000);
+  const fetchCreatorFeedback = async () => {
+    setCreatorFeedbackError('');
+    setLoadingCreatorFeedback(true);
+    try {
+      if (!user.feedback_token) throw new Error('Sign out and sign in again to view feedback.');
+      const tracksResponse = await fetch(`${API_BASE}/tracks/`, { headers: getHeaders() });
+      if (!tracksResponse.ok) throw new Error('Could not load your tracks.');
+      const tracks = await tracksResponse.json();
+      const summaries = await Promise.all(tracks.map(async (track) => {
+        const res = await fetch(`${API_BASE}/tracks/${track.id}/feedback/`, { headers: getHeaders() });
+        if (res.status === 401) throw new Error('Sign out and sign in again to view feedback.');
+        if (!res.ok) throw new Error('Could not load feedback.');
+        return { ...track, ...await res.json() };
+      }));
+      setCreatorTracks(summaries);
+    } catch (error) {
+      setCreatorFeedbackError(error.message);
+    } finally {
+      setLoadingCreatorFeedback(false);
+    }
+  };
+
+  const handleConfirmUnlock = async () => {
+    if (unlockingFeedback) return;
+    setUnlockingFeedback(true);
+    setUnlockError('');
+    try {
+      const res = await fetch(`${API_BASE}/feedback/${selectedFeedback.id}/unlock/`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({ confirm: true })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(res.status === 401
+        ? 'Sign out and sign in again to unlock feedback.'
+        : data.error || 'Could not unlock feedback.');
+
+      setCreatorTracks((tracks) => tracks.map((track) => ({
+        ...track,
+        comments: track.comments.map((comment) => comment.id === selectedFeedback.id
+          ? { ...comment, unlocked: true }
+          : comment)
+      })));
+      setSelectedFeedback(null);
+      fetchChats();
+    } catch (error) {
+      setUnlockError(error.message);
+    } finally {
+      setUnlockingFeedback(false);
+    }
   };
 
   // Save Track Action
@@ -724,7 +774,7 @@ function App() {
                 ) : (
                   <div style={{ textAlign: 'center', padding: '60px 20px', color: 'hsl(var(--text-secondary))' }}>
                     <div style={{ fontSize: '32px', marginBottom: '10px' }}>💬</div>
-                    <p>No active chats. Complete feedback on an artist's track to start a private chat room!</p>
+                    <p>No active chats. A private chat opens when the artist unlocks feedback.</p>
                   </div>
                 )}
               </div>
@@ -809,6 +859,45 @@ function App() {
               </div>
             )}
           </div>
+        )}
+
+        {currentTab === 'feedback' && user?.role === 'creator' && (
+          <section className="upload-container">
+            <h3>Track Feedback</h3>
+            <button className="btn-secondary" onClick={fetchCreatorFeedback} disabled={loadingCreatorFeedback}>
+              Refresh feedback
+            </button>
+            {creatorFeedbackError && <p role="alert">{creatorFeedbackError}</p>}
+            {loadingCreatorFeedback && <p role="status">Loading feedback…</p>}
+            {!loadingCreatorFeedback && !creatorFeedbackError && creatorTracks.length === 0 && <p>No tracks yet.</p>}
+            <div className="chat-list">
+              {creatorTracks.map((track) => (
+                <section key={track.id} className="feedback-track">
+                  <h4>{track.track_name}</h4>
+                  <p>{track.feedback_count} of {track.max_listeners} comments received</p>
+                  <ol>
+                    {track.comments.map((comment, index) => (
+                      <li key={comment.id}>
+                        Comment {index + 1} · {comment.unlocked ? 'Unlocked' : 'Locked'}
+                        {!comment.unlocked && (
+                          <button className="btn-secondary" onClick={() => {
+                            setUnlockError('');
+                            setSelectedFeedback(comment);
+                          }}>
+                            Unlock comment {index + 1} for €4.99
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ol>
+                </section>
+              ))}
+            </div>
+            <button className="btn-secondary" onClick={() => {
+              fetchChats();
+              setCurrentTab('chats');
+            }}>Open private chats</button>
+          </section>
         )}
 
         {/* VIEW 4: Upload Track */}
@@ -966,6 +1055,25 @@ function App() {
           <span>Preferences</span>
         </button>
 
+        {user?.role === 'listener' && (
+          <button className={`nav-item ${currentTab === 'chats' ? 'active' : ''}`}
+            onClick={() => {
+              fetchChats();
+              setCurrentTab('chats');
+            }}>
+            <div className="nav-icon">💬</div>
+            <span>Chats</span>
+          </button>
+        )}
+
+        {user?.role === 'creator' && (
+          <button className={`nav-item ${currentTab === 'feedback' ? 'active' : ''}`}
+            onClick={() => setCurrentTab('feedback')}>
+            <div className="nav-icon">💬</div>
+            <span>Feedback</span>
+          </button>
+        )}
+
         {/* BUTTON 4: Swipe Feed */}
         <button 
           className={`nav-item ${currentTab === 'swipe' ? 'active' : ''}`}
@@ -1060,7 +1168,7 @@ function App() {
               Suggest Improvement
             </h3>
             <p style={{ fontSize: '11px', color: 'hsl(var(--text-secondary))', marginBottom: '12px' }}>
-              Leaving feedback creates a private chat with <strong>{commentingTrack.artist_name}</strong>.
+              Your feedback stays locked until <strong>{commentingTrack.artist_name}</strong> unlocks it.
             </p>
             
             <div className="comment-overlay-container">
@@ -1070,92 +1178,27 @@ function App() {
                 value={feedbackComment}
                 onChange={(e) => setFeedbackComment(e.target.value)}
               />
-              <button className="btn-primary" onClick={handleFeedbackSubmit}>
-                Confirm feedback ($9.99)
+              {feedbackError && <p role="alert">{feedbackError}</p>}
+              <button className="btn-primary" onClick={handleFeedbackSubmit} disabled={submittingFeedback || !feedbackComment.trim()}>
+                {submittingFeedback ? 'Sending…' : 'Send feedback'}
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* MODAL 3: Stripe Mock Payment screen */}
-      {showPayment && (
+      {selectedFeedback && (
         <div className="modal-overlay">
-          <div className="modal-content payment-modal">
-            {paymentStep === 'checkout' && (
-              <>
-                <div className="payment-header">
-                  <div className="payment-badge">💳 Secure checkout</div>
-                  <h3 style={{ fontSize: '20px', marginTop: '12px' }}>Unlock Feedback Delivery</h3>
-                  <p style={{ fontSize: '12px', color: 'hsl(var(--text-secondary))', marginTop: '6px' }}>
-                    Deliver your advice to complete the track.
-                  </p>
-                </div>
-                
-                <div style={{ fontSize: '24px', fontWeight: '800', textAlign: 'center', margin: '14px 0', color: 'white' }}>
-                  $9.99
-                </div>
-
-                <div className="card-form">
-                  <div className="form-group">
-                    <label className="form-label">Cardholder Name</label>
-                    <input type="text" className="form-input" placeholder="Sarah Ears" defaultValue="Sarah Ears" />
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Card Number</label>
-                    <input type="text" className="form-input" placeholder="4242 4242 4242 4242" defaultValue="4242 4242 4242 4242" />
-                  </div>
-                  <div className="card-row">
-                    <div>
-                      <label className="form-label">Expiry</label>
-                      <input type="text" className="form-input" placeholder="MM/YY" defaultValue="12/28" />
-                    </div>
-                    <div>
-                      <label className="form-label">CVC</label>
-                      <input type="text" className="form-input" placeholder="123" defaultValue="123" />
-                    </div>
-                    <div>
-                      <label className="form-label">ZIP</label>
-                      <input type="text" className="form-input" placeholder="90210" defaultValue="94103" />
-                    </div>
-                  </div>
-                </div>
-
-                <button className="btn-primary pay-btn" onClick={processMockPayment}>
-                  Authorize Payment
-                </button>
-                <button 
-                  className="auth-toggle" 
-                  style={{ display: 'block', margin: '12px auto 0' }}
-                  onClick={() => setShowPayment(false)}
-                >
-                  Cancel
-                </button>
-              </>
-            )}
-
-            {paymentStep === 'processing' && (
-              <div style={{ textAlign: 'center', padding: '40px 0' }}>
-                <div className="empty-icon" style={{ animation: 'glowPulse 1s infinite' }}>🔒</div>
-                <h4 style={{ marginTop: '16px' }}>Processing Payment...</h4>
-                <p style={{ fontSize: '12px', color: 'hsl(var(--text-secondary))', marginTop: '6px' }}>
-                  Validating sandbox credit card details via mock Stripe gateway.
-                </p>
-              </div>
-            )}
-
-            {paymentStep === 'success' && (
-              <div className="success-visual">
-                <div className="success-check">✓</div>
-                <h3>Payment Approved!</h3>
-                <p style={{ fontSize: '13px', color: 'hsl(var(--text-secondary))' }}>
-                  Your comments have been delivered. A private chat room has been opened with the artist.
-                </p>
-                <button className="btn-primary" onClick={() => { setShowPayment(false); setCurrentTab('chats'); }}>
-                  Enter Private Chat
-                </button>
-              </div>
-            )}
+          <div className="modal-content" role="dialog" aria-modal="true" aria-labelledby="unlock-feedback-title">
+            <h3 id="unlock-feedback-title">Unlock comment</h3>
+            <p>Simulated payment of €4.99. The comment will appear in your private chat.</p>
+            {unlockError && <p role="alert">{unlockError}</p>}
+            <button className="btn-primary" onClick={handleConfirmUnlock} disabled={unlockingFeedback}>
+              {unlockingFeedback ? 'Unlocking…' : 'Confirm simulated payment'}
+            </button>
+            <button className="btn-secondary" onClick={() => setSelectedFeedback(null)} disabled={unlockingFeedback}>
+              Cancel
+            </button>
           </div>
         </div>
       )}
