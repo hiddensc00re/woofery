@@ -10,7 +10,10 @@ from django.core import signing
 from django.contrib.auth.models import User
 from django.db import transaction
 from django.db.models import Q
-from .models import UserProfile, Track, Feedback, ChatRoom, ChatMessage, SavedTrack
+from django.utils import timezone
+from .models import (
+    ChatMessage, ChatRoom, Feedback, FeedbackPayout, SavedTrack, Track, UserProfile,
+)
 
 def get_user_from_request(request):
     """
@@ -272,9 +275,11 @@ def unlock_feedback(request, feedback_id):
 
     already_unlocked = feedback.chat_message_id is not None
     if not already_unlocked:
-        room, _ = ChatRoom.objects.get_or_create(
+        room, _ = ChatRoom.objects.select_for_update().get_or_create(
             track=track, listener=feedback.listener, uploader=track.uploader
         )
+        if room.closed_at is not None:
+            return Response({'error': 'This chat is closed'}, status=409)
         feedback.chat_message = ChatMessage.objects.create(
             room=room, sender=feedback.listener, content=feedback.comment
         )
@@ -304,6 +309,8 @@ def chat_rooms_list(request):
             data.append({
                 'id': r.id,
                 'track_id': r.track.id,
+                'closed_at': r.closed_at,
+                'close_reason': r.close_reason,
                 'track_name': r.track.track_name,
                 'artist_name': r.track.artist_name,
                 'other_username': other_user.username,
@@ -313,14 +320,54 @@ def chat_rooms_list(request):
             })
         return Response(data)
 
+@api_view(['POST'])
+@transaction.atomic
+def close_chat(request, room_id):
+    user = get_feedback_api_user(request)
+    if not user:
+        return Response({'error': 'Authentication required'}, status=401)
+
+    room = get_object_or_404(ChatRoom.objects.select_for_update(), pk=room_id)
+    if room.track.uploader_id != user.id:
+        return Response({'error': 'Only the track creator can close this chat'}, status=403)
+    if request.data.get('reason') != ChatRoom.CloseReason.COMMENT_NOT_HELPFUL:
+        return Response({'error': 'Invalid close reason'}, status=400)
+
+    feedback = Feedback.objects.filter(
+        chat_message__room=room, track_id=room.track_id, listener_id=room.listener_id,
+    ).first()
+    if room.track.feedback_declined or feedback is None:
+        return Response({'error': 'This chat has no eligible unlocked feedback'}, status=409)
+
+    if room.closed_at is None:
+        room.close_reason = ChatRoom.CloseReason.COMMENT_NOT_HELPFUL
+        room.closed_at = timezone.now()
+        room.save(update_fields=['close_reason', 'closed_at'])
+        if feedback.grammar_review == Feedback.GrammarReview.PASSED:
+            FeedbackPayout.objects.get_or_create(
+                feedback=feedback, defaults={'amount_cents': 100, 'currency': 'EUR'},
+            )
+
+    payout = FeedbackPayout.objects.filter(feedback=feedback).first()
+    return Response({
+        'chat_room_id': room.id,
+        'closed_at': room.closed_at,
+        'close_reason': room.close_reason,
+        'payout_due': payout is not None,
+        'payout': {'amount_cents': payout.amount_cents, 'currency': payout.currency} if payout else None,
+    })
+
+
 @api_view(['GET', 'POST'])
+@transaction.atomic
 def chat_messages(request, room_id):
     user = get_user_from_request(request)
     if not user:
         return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
         
     try:
-        room = ChatRoom.objects.get(id=int(room_id))
+        rooms = ChatRoom.objects.select_for_update() if request.method == 'POST' else ChatRoom.objects.all()
+        room = rooms.get(pk=room_id)
     except (ValueError, ChatRoom.DoesNotExist):
         return Response({'error': 'Chat room not found'}, status=status.HTTP_404_NOT_FOUND)
         
@@ -328,6 +375,8 @@ def chat_messages(request, room_id):
         return Response({'error': 'Access denied'}, status=status.HTTP_403_FORBIDDEN)
         
     if request.method == 'POST':
+        if room.closed_at is not None:
+            return Response({'error': 'This chat is closed'}, status=409)
         content = request.data.get('content')
         if not content:
             return Response({'error': 'Message content required'}, status=status.HTTP_400_BAD_REQUEST)

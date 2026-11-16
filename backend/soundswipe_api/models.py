@@ -28,9 +28,17 @@ class Track(models.Model):
         return f"{self.artist_name} - {self.track_name}"
 
 class Feedback(models.Model):
+    class GrammarReview(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        PASSED = 'passed', 'Passed'
+        FAILED = 'failed', 'Failed'
+
     track = models.ForeignKey(Track, on_delete=models.CASCADE, related_name='feedbacks')
     listener = models.ForeignKey(User, on_delete=models.CASCADE, related_name='given_feedbacks')
     comment = models.TextField()
+    grammar_review = models.CharField(
+        max_length=7, choices=GrammarReview.choices, default=GrammarReview.PENDING,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     chat_message = models.OneToOneField(
@@ -42,10 +50,16 @@ class Feedback(models.Model):
         return f"Feedback by {self.listener.username} on {self.track.track_name}"
 
 class ChatRoom(models.Model):
+    class CloseReason(models.TextChoices):
+        COMMENT_NOT_HELPFUL = 'comment_not_helpful', 'The comment didn’t help me'
+
     track = models.ForeignKey(Track, on_delete=models.CASCADE, related_name='chat_rooms')
     listener = models.ForeignKey(User, on_delete=models.CASCADE, related_name='listener_chats')
     uploader = models.ForeignKey(User, on_delete=models.CASCADE, related_name='uploader_chats')
     created_at = models.DateTimeField(auto_now_add=True)
+
+    close_reason = models.CharField(max_length=32, choices=CloseReason.choices, blank=True)
+    closed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         unique_together = ('track', 'listener', 'uploader')
@@ -64,6 +78,13 @@ class ChatMessage(models.Model):
 
     def __str__(self):
         return f"{self.sender.username} in Room {self.room.id} at {self.timestamp}"
+
+class FeedbackPayout(models.Model):
+    feedback = models.OneToOneField(Feedback, on_delete=models.CASCADE, related_name='payout')
+    amount_cents = models.PositiveIntegerField()
+    currency = models.CharField(max_length=3)
+    created_at = models.DateTimeField(auto_now_add=True)
+
 
 class SavedTrack(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='saved_tracks')
