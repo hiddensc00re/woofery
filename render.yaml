@@ -1,0 +1,14 @@
+services:
+  - type: cron
+    name: woofery-staging-ghosting
+    runtime: python
+    branch: codex/feedback-unlock
+    rootDir: backend
+    schedule: "*/15 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: >-
+      DATABASE_URL="${STAGING_DATABASE_URL:?Set STAGING_DATABASE_URL to the migrated staging database}"
+      python manage.py process_ghosting_reports
+    envVars:
+      - key: STAGING_DATABASE_URL
+        sync: false
