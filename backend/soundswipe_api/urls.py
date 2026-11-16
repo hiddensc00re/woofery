@@ -11,6 +11,7 @@ urlpatterns = [
     path('feedback/<int:feedback_id>/unlock/', views.unlock_feedback, name='unlock_feedback'),
     path('feedback/', views.submit_feedback, name='feedback'),
     path('chats/', views.chat_rooms_list, name='chats'),
+    path('chats/<int:room_id>/report-ghosting/', views.report_ghosting, name='report_ghosting'),
     path('chats/<int:room_id>/close/', views.close_chat, name='close_chat'),
     path('chats/<int:room_id>/', views.chat_messages, name='chat_messages'),
     path('messages/<int:message_id>/blockchain/', views.blockchain_consent, name='blockchain_consent'),

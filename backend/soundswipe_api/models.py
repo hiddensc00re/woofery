@@ -86,6 +86,12 @@ class FeedbackPayout(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 
+class GhostingReport(models.Model):
+    feedback = models.OneToOneField(Feedback, on_delete=models.CASCADE, related_name='ghosting_report')
+    deadline = models.DateTimeField(db_index=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+
+
 class SavedTrack(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='saved_tracks')
     track = models.ForeignKey(Track, on_delete=models.CASCADE)

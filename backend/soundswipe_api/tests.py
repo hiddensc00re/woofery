@@ -1,8 +1,13 @@
+from datetime import datetime, timedelta, timezone
+from io import StringIO
+from unittest.mock import patch
+
+from django.core.management import call_command
 from django.contrib.auth.models import User
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
-from .models import ChatMessage, ChatRoom, Feedback, FeedbackPayout, Track, UserProfile
+from .models import ChatMessage, ChatRoom, Feedback, FeedbackPayout, GhostingReport, Track, UserProfile
 
 class SoundSwipeAPITests(APITestCase):
 
@@ -275,4 +280,122 @@ class SoundSwipeAPITests(APITestCase):
         unlocked = self.client.post(reverse('unlock_feedback', args=[feedback.id]),
             {'confirm': True}, format='json', **self.feedback_auth_headers(self.creator))
         self.assertEqual(unlocked.status_code, 200)
+        feedback.refresh_from_db(fields=['chat_message'])
         return feedback, unlocked.data['chat_room_id']
+
+    def test_ghosting_report_permissions_and_unchanged_deadline(self):
+        feedback, room_id = self.make_unlocked_feedback(Feedback.GrammarReview.PASSED)
+        url = reverse('report_ghosting', args=[room_id])
+        listener = self.feedback_auth_headers(self.listener)
+        with patch('django.utils.timezone.now') as clock:
+            clock.return_value = datetime(2026, 11, 14, tzinfo=timezone.utc)
+            self.assertEqual(self.client.post(url).status_code, 401)
+            self.assertEqual(self.client.post(url, **self.feedback_auth_headers(self.creator)).status_code, 403)
+            other = User.objects.create_user('other_listener', password='password123')
+            self.assertEqual(self.client.post(url, **self.feedback_auth_headers(other)).status_code, 403)
+            report = self.client.post(url, **listener)
+            self.assertEqual(report.status_code, 201)
+            self.assertEqual(report.data['deadline'], clock.return_value + timedelta(days=7))
+            clock.return_value += timedelta(days=2)
+            retry = self.client.post(url, **listener)
+            self.assertEqual(retry.status_code, 200)
+            self.assertEqual(retry.data, report.data)
+            self.assertEqual(GhostingReport.objects.get().feedback_id, feedback.id)
+
+    def test_ghosting_report_requires_unlocked_open_chat_without_creator_reply(self):
+        feedback, room_id = self.make_unlocked_feedback(Feedback.GrammarReview.PASSED)
+        room = ChatRoom.objects.get(pk=room_id)
+        url = reverse('report_ghosting', args=[room_id])
+        listener = self.feedback_auth_headers(self.listener)
+        with patch('django.utils.timezone.now', return_value=datetime(2026, 11, 14, tzinfo=timezone.utc)):
+            message_id = feedback.chat_message_id
+            Feedback.objects.filter(pk=feedback.pk).update(chat_message=None)
+            self.assertEqual(self.client.post(url, **listener).status_code, 409)
+            Feedback.objects.filter(pk=feedback.pk).update(chat_message_id=message_id)
+            reply = self.client.post(reverse('chat_messages', args=[room_id]), {'content': 'Thanks'},
+                format='json', HTTP_X_USER_ID=str(self.creator.id))
+            self.assertEqual(reply.status_code, 201)
+            self.assertEqual(self.client.post(url, **listener).status_code, 409)
+            room.messages.filter(pk=reply.data['id']).delete()
+            closed = self.client.post(reverse('close_chat', args=[room_id]), {'reason': 'comment_not_helpful'},
+                format='json', **self.feedback_auth_headers(self.creator))
+            self.assertEqual(closed.status_code, 200)
+            self.assertEqual(self.client.post(url, **listener).status_code, 409)
+        self.assertFalse(GhostingReport.objects.exists())
+
+    def test_early_reply_disqualifies_ghosting_payout(self):
+        with patch('django.utils.timezone.now') as clock:
+            clock.return_value = datetime(2026, 11, 14, tzinfo=timezone.utc)
+            _, room_id = self.make_unlocked_feedback(Feedback.GrammarReview.PASSED)
+            deadline = self.report_ghosting_deadline(room_id)
+            clock.return_value = deadline - timedelta(seconds=1)
+            reply = self.client.post(reverse('chat_messages', args=[room_id]), {'content': 'Thanks'},
+                format='json', HTTP_X_USER_ID=str(self.creator.id))
+            self.assertEqual(reply.status_code, 201)
+            clock.return_value = deadline
+            call_command('process_ghosting_reports', stdout=StringIO())
+        self.assertFalse(FeedbackPayout.objects.exists())
+        self.assertEqual(GhostingReport.objects.get().processed_at, deadline)
+
+    def test_early_closure_applies_closure_payout_rule(self):
+        for review in (Feedback.GrammarReview.PASSED, Feedback.GrammarReview.FAILED):
+            with self.subTest(review=review), patch('django.utils.timezone.now') as clock:
+                clock.return_value = datetime(2026, 11, 14, tzinfo=timezone.utc)
+                feedback, room_id = self.make_unlocked_feedback(review)
+                deadline = self.report_ghosting_deadline(room_id)
+                clock.return_value = deadline - timedelta(seconds=1)
+                response = self.client.post(reverse('close_chat', args=[room_id]),
+                    {'reason': 'comment_not_helpful'}, format='json', **self.feedback_auth_headers(self.creator))
+                self.assertEqual(response.status_code, 200)
+                expected_count = int(review == Feedback.GrammarReview.PASSED)
+                self.assertEqual(FeedbackPayout.objects.filter(feedback=feedback).count(), expected_count)
+                clock.return_value = deadline
+                output = StringIO()
+                call_command('process_ghosting_reports', stdout=output)
+                self.assertIn('Recorded 0 new ghosting payouts.', output.getvalue())
+                self.assertEqual(FeedbackPayout.objects.filter(feedback=feedback).count(), expected_count)
+                ChatRoom.objects.get(pk=room_id).delete()
+                feedback.delete()
+
+    def test_expiry_records_one_payout_only_for_passed_review(self):
+        for review in (Feedback.GrammarReview.PASSED, Feedback.GrammarReview.FAILED):
+            with self.subTest(review=review), patch('django.utils.timezone.now') as clock:
+                clock.return_value = datetime(2026, 11, 14, tzinfo=timezone.utc)
+                feedback, room_id = self.make_unlocked_feedback(review)
+                deadline = self.report_ghosting_deadline(room_id)
+                clock.return_value = deadline - timedelta(seconds=1)
+                call_command('process_ghosting_reports', stdout=StringIO())
+                self.assertIsNone(GhostingReport.objects.get(feedback=feedback).processed_at)
+                self.assertFalse(FeedbackPayout.objects.filter(feedback=feedback).exists())
+
+                clock.return_value = deadline
+                call_command('process_ghosting_reports', stdout=StringIO())
+                expected = [(100, 'EUR')] if review == Feedback.GrammarReview.PASSED else []
+                payouts = FeedbackPayout.objects.filter(feedback=feedback)
+                self.assertEqual(list(payouts.values_list('amount_cents', 'currency')), expected)
+                self.assertEqual(GhostingReport.objects.get(feedback=feedback).processed_at, deadline)
+                clock.return_value += timedelta(hours=1)
+                call_command('process_ghosting_reports', stdout=StringIO())
+                closed = self.client.post(reverse('close_chat', args=[room_id]), {'reason': 'comment_not_helpful'},
+                    format='json', **self.feedback_auth_headers(self.creator))
+                self.assertEqual(closed.status_code, 200)
+                self.assertEqual(list(payouts.values_list('amount_cents', 'currency')), expected)
+                ChatRoom.objects.get(pk=room_id).delete()
+                feedback.delete()
+
+    def test_reply_after_deadline_does_not_cancel_earned_payout(self):
+        with patch('django.utils.timezone.now') as clock:
+            clock.return_value = datetime(2026, 11, 14, tzinfo=timezone.utc)
+            feedback, room_id = self.make_unlocked_feedback(Feedback.GrammarReview.PASSED)
+            clock.return_value = self.report_ghosting_deadline(room_id) + timedelta(seconds=1)
+            reply = self.client.post(reverse('chat_messages', args=[room_id]), {'content': 'Thanks'},
+                format='json', HTTP_X_USER_ID=str(self.creator.id))
+            self.assertEqual(reply.status_code, 201)
+            call_command('process_ghosting_reports', stdout=StringIO())
+            self.assertEqual(FeedbackPayout.objects.get(feedback=feedback).amount_cents, 100)
+
+    def report_ghosting_deadline(self, room_id):
+        response = self.client.post(reverse('report_ghosting', args=[room_id]),
+            **self.feedback_auth_headers(self.listener))
+        self.assertEqual(response.status_code, 201)
+        return response.data['deadline']

@@ -1,3 +1,4 @@
+from datetime import timedelta
 import os
 import hashlib
 from django.shortcuts import render, get_object_or_404
@@ -11,8 +12,9 @@ from django.contrib.auth.models import User
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
+from .feedback_payouts import record_feedback_payout
 from .models import (
-    ChatMessage, ChatRoom, Feedback, FeedbackPayout, SavedTrack, Track, UserProfile,
+    ChatMessage, ChatRoom, Feedback, FeedbackPayout, GhostingReport, SavedTrack, Track, UserProfile,
 )
 
 def get_user_from_request(request):
@@ -322,6 +324,31 @@ def chat_rooms_list(request):
 
 @api_view(['POST'])
 @transaction.atomic
+def report_ghosting(request, room_id):
+    user = get_feedback_api_user(request)
+    if not user:
+        return Response({'error': 'Authentication required'}, status=401)
+
+    room = get_object_or_404(ChatRoom.objects.select_for_update(), pk=room_id)
+    if room.listener_id != user.id:
+        return Response({'error': 'Only the feedback listener can report ghosting'}, status=403)
+
+    feedback = Feedback.objects.filter(
+        chat_message__room=room, track_id=room.track_id, listener_id=user.id,
+    ).first()
+    if feedback is None or room.track.feedback_declined or room.closed_at is not None:
+        return Response({'error': 'An open chat with unlocked feedback is required'}, status=409)
+    if room.messages.filter(sender_id=room.track.uploader_id).exists():
+        return Response({'error': 'The creator has already replied'}, status=409)
+
+    report, created = GhostingReport.objects.get_or_create(
+        feedback=feedback, defaults={'deadline': timezone.now() + timedelta(days=7)},
+    )
+    return Response({'deadline': report.deadline}, status=201 if created else 200)
+
+
+@api_view(['POST'])
+@transaction.atomic
 def close_chat(request, room_id):
     user = get_feedback_api_user(request)
     if not user:
@@ -343,10 +370,7 @@ def close_chat(request, room_id):
         room.close_reason = ChatRoom.CloseReason.COMMENT_NOT_HELPFUL
         room.closed_at = timezone.now()
         room.save(update_fields=['close_reason', 'closed_at'])
-        if feedback.grammar_review == Feedback.GrammarReview.PASSED:
-            FeedbackPayout.objects.get_or_create(
-                feedback=feedback, defaults={'amount_cents': 100, 'currency': 'EUR'},
-            )
+        record_feedback_payout(feedback)
 
     payout = FeedbackPayout.objects.filter(feedback=feedback).first()
     return Response({
