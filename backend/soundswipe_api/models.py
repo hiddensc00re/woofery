@@ -20,6 +20,7 @@ class Track(models.Model):
     cover_image = models.ImageField(upload_to='covers/', blank=True, null=True)
     target_feedback = models.TextField(help_text="What the artist is looking for to improve the track")
     max_listeners = models.PositiveIntegerField(default=5)
+    feedback_declined = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

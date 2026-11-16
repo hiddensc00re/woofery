@@ -118,6 +118,7 @@ class SoundSwipeAPITests(APITestCase):
 
         self.track.refresh_from_db()
         self.assertFalse(self.track.is_active)
+        self.assertEqual(self.client.post(summary_url, **creator_headers).status_code, 409)
         repeated = self.client.post(unlock_url, {'confirm': True},
             format='json', **creator_headers)
         self.assertEqual(repeated.status_code, 200)
@@ -134,3 +135,54 @@ class SoundSwipeAPITests(APITestCase):
         summary = self.client.get(summary_url, **creator_headers)
         self.assertEqual([item['unlocked'] for item in summary.data['comments']],
             [True, False, False, False, False])
+
+    def test_only_owner_can_decline_full_locked_feedback(self):
+        from .models import ChatRoom
+
+        def sign_in(username):
+            response = self.client.post(reverse('login'), {
+                'username': username, 'password': 'password123',
+            }, format='json')
+            return {'HTTP_AUTHORIZATION': 'Bearer ' + response.data['feedback_token']}
+
+        owner = sign_in(self.creator.username)
+        listener = sign_in(self.listener.username)
+        other_creator = User.objects.create_user('other_creator', password='password123')
+        UserProfile.objects.create(user=other_creator, role='creator')
+        other = sign_in(other_creator.username)
+        url = reverse('track_feedback', args=[self.track.id])
+
+        self.assertEqual(self.client.post(url, **owner).status_code, 409)
+        listeners = [self.listener] + [
+            User.objects.create_user(f'decline_listener_{i}') for i in range(4)
+        ]
+        feedback_ids = []
+        for index, account in enumerate(listeners):
+            response = self.client.post(reverse('feedback'), {
+                'track_id': self.track.id, 'comment': f'Locked advice {index}',
+            }, format='json', HTTP_X_USER_ID=str(account.id))
+            self.assertEqual(response.status_code, 201)
+            feedback_ids.append(response.data['feedback_id'])
+
+        self.assertEqual(self.client.post(url, **listener).status_code, 403)
+        self.assertEqual(self.client.post(url, **other).status_code, 403)
+        legacy_owner = {'HTTP_X_USER_ID': str(self.creator.id)}
+        self.assertEqual(self.client.post(url, **legacy_owner).status_code, 401)
+        self.assertTrue(self.client.get(url, **owner).data['can_decline'])
+        self.assertEqual(self.client.post(url, **owner).status_code, 200)
+        summary = self.client.get(url, **owner).data
+        self.assertTrue(summary['declined'])
+        self.assertEqual(summary['feedback_count'], 5)
+        self.assertFalse(summary['can_decline'])
+        self.assertFalse(summary['can_unlock'])
+        self.assertEqual(summary['comments'], [
+            {'id': feedback_id, 'unlocked': False} for feedback_id in feedback_ids
+        ])
+
+        for feedback_id in feedback_ids:
+            unlock = self.client.post(reverse('unlock_feedback', args=[feedback_id]),
+                {'confirm': True}, format='json', **owner)
+            self.assertEqual(unlock.status_code, 409)
+        self.assertEqual(self.client.get(reverse('chats'), **legacy_owner).data, [])
+        self.assertFalse(ChatRoom.objects.exists())
+        self.assertFalse(ChatMessage.objects.exists())

@@ -219,20 +219,34 @@ def get_feedback_api_user(request):
     return User.objects.filter(pk=user_id, is_active=True).first()
 
 
-@api_view(['GET'])
+@api_view(['GET', 'POST'])
+@transaction.atomic
 def track_feedback(request, track_id):
     user = get_feedback_api_user(request)
     if not user:
         return Response({'error': 'Authentication required'}, status=401)
-    track = get_object_or_404(Track, pk=track_id)
+    tracks = Track.objects.select_for_update() if request.method == 'POST' else Track.objects.all()
+    track = get_object_or_404(tracks, pk=track_id)
     if track.uploader_id != user.id:
-        return Response({'error': 'Only the track creator can view feedback'}, status=403)
+        return Response({'error': 'Only the track creator can manage feedback'}, status=403)
 
     comments = list(track.feedbacks.order_by('id').values('id', 'chat_message_id'))
+    any_unlocked = any(comment['chat_message_id'] is not None for comment in comments)
+    can_decline = len(comments) >= track.max_listeners and not any_unlocked and not track.feedback_declined
+    if request.method == 'POST' and not track.feedback_declined:
+        if not can_decline:
+            return Response({'error': 'Declining requires the full set of locked comments'}, status=409)
+        track.feedback_declined = True
+        track.save(update_fields=['feedback_declined'])
+
     return Response({
         'feedback_count': len(comments),
         'max_listeners': track.max_listeners,
-        'can_unlock': any(comment['chat_message_id'] is None for comment in comments),
+        'declined': track.feedback_declined,
+        'can_decline': can_decline and not track.feedback_declined,
+        'can_unlock': not track.feedback_declined and any(
+            comment['chat_message_id'] is None for comment in comments
+        ),
         'comments': [
             {'id': comment['id'], 'unlocked': comment['chat_message_id'] is not None}
             for comment in comments
@@ -246,10 +260,13 @@ def unlock_feedback(request, feedback_id):
     user = get_feedback_api_user(request)
     if not user:
         return Response({'error': 'Authentication required'}, status=401)
-    feedback = get_object_or_404(Feedback.objects.select_for_update(), pk=feedback_id)
-    track = feedback.track
+    feedback = get_object_or_404(Feedback, pk=feedback_id)
+    track = get_object_or_404(Track.objects.select_for_update(), pk=feedback.track_id)
+    feedback.refresh_from_db(fields=['chat_message'])
     if track.uploader_id != user.id:
         return Response({'error': 'Only the track creator can unlock feedback'}, status=403)
+    if track.feedback_declined:
+        return Response({'error': 'Feedback was declined for this track'}, status=409)
     if request.data.get('confirm') is not True:
         return Response({'error': 'Payment confirmation is required'}, status=400)
 

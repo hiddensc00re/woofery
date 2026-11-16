@@ -40,6 +40,9 @@ function App() {
   const [selectedFeedback, setSelectedFeedback] = useState(null);
   const [unlockingFeedback, setUnlockingFeedback] = useState(false);
   const [unlockError, setUnlockError] = useState('');
+  const [decliningTrack, setDecliningTrack] = useState(null);
+  const [declineError, setDeclineError] = useState('');
+  const [savingDecline, setSavingDecline] = useState(false);
 
   // Audio Player State (Global instance)
   const [playingTrackId, setPlayingTrackId] = useState(null);
@@ -241,6 +244,7 @@ function App() {
     setActiveRoom(null);
     setCreatorTracks([]);
     setSelectedFeedback(null);
+    setDecliningTrack(null);
     setCommentingTrack(null);
     setFeedbackComment('');
   };
@@ -384,6 +388,7 @@ function App() {
 
       setCreatorTracks((tracks) => tracks.map((track) => ({
         ...track,
+        can_decline: track.can_decline && !track.comments.some((comment) => comment.id === selectedFeedback.id),
         comments: track.comments.map((comment) => comment.id === selectedFeedback.id
           ? { ...comment, unlocked: true }
           : comment)
@@ -394,6 +399,28 @@ function App() {
       setUnlockError(error.message);
     } finally {
       setUnlockingFeedback(false);
+    }
+  };
+
+  const handleDeclineFeedback = async () => {
+    if (savingDecline) return;
+    setSavingDecline(true);
+    setDeclineError('');
+    try {
+      const res = await fetch(`${API_BASE}/tracks/${decliningTrack.id}/feedback/`, {
+        method: 'POST',
+        headers: getHeaders(),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not decline feedback.');
+      setCreatorTracks((tracks) => tracks.map((track) =>
+        track.id === decliningTrack.id ? { ...track, ...data } : track
+      ));
+      setDecliningTrack(null);
+    } catch (error) {
+      setDeclineError(error.message);
+    } finally {
+      setSavingDecline(false);
     }
   };
 
@@ -875,11 +902,18 @@ function App() {
                 <section key={track.id} className="feedback-track">
                   <h4>{track.track_name}</h4>
                   <p>{track.feedback_count} of {track.max_listeners} comments received</p>
+                  {track.declined && <p role="status">All comments declined</p>}
+                  {track.can_decline && (
+                    <button className="btn-secondary" onClick={() => {
+                      setDeclineError('');
+                      setDecliningTrack(track);
+                    }}>Decline all comments</button>
+                  )}
                   <ol>
                     {track.comments.map((comment, index) => (
                       <li key={comment.id}>
                         Comment {index + 1} · {comment.unlocked ? 'Unlocked' : 'Locked'}
-                        {!comment.unlocked && (
+                        {!track.declined && !comment.unlocked && (
                           <button className="btn-secondary" onClick={() => {
                             setUnlockError('');
                             setSelectedFeedback(comment);
@@ -1183,6 +1217,22 @@ function App() {
                 {submittingFeedback ? 'Sending…' : 'Send feedback'}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {decliningTrack && (
+        <div className="modal-overlay">
+          <div className="modal-content" role="dialog" aria-modal="true" aria-labelledby="decline-feedback-title">
+            <h3 id="decline-feedback-title">Decline all comments?</h3>
+            <p>The comments on {decliningTrack.track_name} will stay locked permanently.</p>
+            {declineError && <p role="alert">{declineError}</p>}
+            <button className="btn-primary" onClick={handleDeclineFeedback} disabled={savingDecline}>
+              Confirm decline
+            </button>
+            <button className="btn-secondary" onClick={() => setDecliningTrack(null)} disabled={savingDecline}>
+              Cancel
+            </button>
           </div>
         </div>
       )}
