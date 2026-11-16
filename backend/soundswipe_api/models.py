@@ -32,6 +32,11 @@ class Feedback(models.Model):
     comment = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
 
+    chat_message = models.OneToOneField(
+        'ChatMessage', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='feedback',
+    )
+
     def __str__(self):
         return f"Feedback by {self.listener.username} on {self.track.track_name}"
 

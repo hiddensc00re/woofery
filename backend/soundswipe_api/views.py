@@ -5,8 +5,10 @@ from rest_framework.decorators import api_view, parser_classes
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
-from django.contrib.auth import authenticate, login as django_login
+from django.contrib.auth import authenticate
+from django.core import signing
 from django.contrib.auth.models import User
+from django.db import transaction
 from django.db.models import Q
 from .models import UserProfile, Track, Feedback, ChatRoom, ChatMessage, SavedTrack
 
@@ -60,7 +62,8 @@ def login_user(request):
         return Response({
             'user_id': user.id,
             'username': user.username,
-            'role': profile.role
+            'role': profile.role,
+            'feedback_token': signing.dumps(user.id, salt='feedback-api'),
         })
     else:
         return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
@@ -157,6 +160,7 @@ def get_swipe_deck(request):
     return Response(data)
 
 @api_view(['POST'])
+@transaction.atomic
 def submit_feedback(request):
     user = get_user_from_request(request)
     if not user:
@@ -169,10 +173,13 @@ def submit_feedback(request):
         return Response({'error': 'Track ID and comment are required'}, status=status.HTTP_400_BAD_REQUEST)
         
     try:
-        track = Track.objects.get(id=int(track_id))
+        track = Track.objects.select_for_update().get(id=int(track_id))
     except (ValueError, Track.DoesNotExist):
         return Response({'error': 'Track not found'}, status=status.HTTP_404_NOT_FOUND)
         
+    if track.uploader_id == user.id:
+        return Response({'error': 'The creator cannot review their own track'}, status=403)
+
     if not track.is_active:
         return Response({'error': 'Track is no longer accepting feedback'}, status=status.HTTP_400_BAD_REQUEST)
         
@@ -192,24 +199,79 @@ def submit_feedback(request):
         track.is_active = False
         track.save()
         
-    room, created = ChatRoom.objects.get_or_create(
-        track=track,
-        listener=user,
-        uploader=track.uploader
-    )
-    
-    ChatMessage.objects.create(
-        room=room,
-        sender=user,
-        content=comment
-    )
-    
     return Response({
         'status': 'feedback_saved',
         'feedback_id': feedback.id,
-        'chat_room_id': room.id,
         'track_active': track.is_active
     }, status=status.HTTP_201_CREATED)
+
+def get_feedback_api_user(request):
+    if request.user.is_authenticated:
+        return request.user
+    scheme, _, token = request.headers.get('Authorization', '').partition(' ')
+    if scheme.lower() != 'bearer' or not token:
+        return None
+    try:
+        user_id = signing.loads(token, salt='feedback-api', max_age=3600)
+    except signing.BadSignature:
+        return None
+    return User.objects.filter(pk=user_id, is_active=True).first()
+
+
+@api_view(['GET'])
+def track_feedback(request, track_id):
+    user = get_feedback_api_user(request)
+    if not user:
+        return Response({'error': 'Authentication required'}, status=401)
+    track = get_object_or_404(Track, pk=track_id)
+    if track.uploader_id != user.id:
+        return Response({'error': 'Only the track creator can view feedback'}, status=403)
+
+    comments = list(track.feedbacks.order_by('id').values('id', 'chat_message_id'))
+    return Response({
+        'feedback_count': len(comments),
+        'max_listeners': track.max_listeners,
+        'can_unlock': len(comments) >= track.max_listeners,
+        'comments': [
+            {'id': comment['id'], 'unlocked': comment['chat_message_id'] is not None}
+            for comment in comments
+        ],
+    })
+
+
+@api_view(['POST'])
+@transaction.atomic
+def unlock_feedback(request, feedback_id):
+    user = get_feedback_api_user(request)
+    if not user:
+        return Response({'error': 'Authentication required'}, status=401)
+    feedback = get_object_or_404(Feedback.objects.select_for_update(), pk=feedback_id)
+    track = feedback.track
+    if track.uploader_id != user.id:
+        return Response({'error': 'Only the track creator can unlock feedback'}, status=403)
+    if track.feedbacks.count() < track.max_listeners:
+        return Response({'error': 'The track has not reached its feedback target'}, status=409)
+    if request.data.get('confirm') is not True:
+        return Response({'error': 'Payment confirmation is required'}, status=400)
+
+    already_unlocked = feedback.chat_message_id is not None
+    if not already_unlocked:
+        room, _ = ChatRoom.objects.get_or_create(
+            track=track, listener=feedback.listener, uploader=track.uploader
+        )
+        feedback.chat_message = ChatMessage.objects.create(
+            room=room, sender=feedback.listener, content=feedback.comment
+        )
+        feedback.save(update_fields=['chat_message'])
+
+    return Response({
+        'feedback_id': feedback.id,
+        'chat_room_id': feedback.chat_message.room_id,
+        'message_id': feedback.chat_message_id,
+        'already_unlocked': already_unlocked,
+        'payment': {'simulated': True, 'amount_cents': 499, 'currency': 'EUR'},
+    })
+
 
 @api_view(['GET', 'POST'])
 def chat_rooms_list(request):

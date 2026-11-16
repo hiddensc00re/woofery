@@ -1,9 +1,8 @@
-from django.test import TestCase
 from django.contrib.auth.models import User
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
-from .models import UserProfile, Track, Feedback, ChatRoom, ChatMessage
+from .models import UserProfile, Track, ChatMessage
 
 class SoundSwipeAPITests(APITestCase):
 
@@ -51,7 +50,7 @@ class SoundSwipeAPITests(APITestCase):
         self.assertEqual(response.data['role'], 'creator')
 
     def test_get_swipe_deck(self):
-        url = reverse('swipe_deck')
+        url = reverse('deck')
         # Call without auth headers -> should fail
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
@@ -62,22 +61,72 @@ class SoundSwipeAPITests(APITestCase):
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]['track_name'], 'Test Track')
 
-    def test_submit_feedback_creates_chat(self):
-        url = reverse('submit_feedback')
-        data = {
-            'track_id': self.track.id,
-            'comment': 'I suggest modifying the snare reverb.'
-        }
-        # Submit feedback
-        response = self.client.post(url, data, format='json', HTTP_X_USER_ID=str(self.listener.id))
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(response.data['status'], 'feedback_saved')
-        
-        # Verify ChatRoom was created
-        room_exists = ChatRoom.objects.filter(track=self.track, listener=self.listener).exists()
-        self.assertTrue(room_exists)
-        
-        # Verify chat message was auto-added
-        room = ChatRoom.objects.get(track=self.track, listener=self.listener)
-        self.assertEqual(room.messages.count(), 1)
-        self.assertEqual(room.messages.first().content, 'I suggest modifying the snare reverb.')
+    def test_feedback_unlock_lifecycle(self):
+        def authenticate_for_feedback(user):
+            login = self.client.post(reverse('login'), {
+                'username': user.username, 'password': 'password123',
+            }, format='json')
+            self.assertEqual(login.status_code, 200)
+            return {'HTTP_AUTHORIZATION': 'Bearer ' + login.data['feedback_token']}
+
+        creator_headers = authenticate_for_feedback(self.creator)
+        listener_headers = authenticate_for_feedback(self.listener)
+        chat_headers = {'HTTP_X_USER_ID': str(self.creator.id)}
+        summary_url = reverse('track_feedback', args=[self.track.id])
+        listeners = [self.listener] + [
+            User.objects.create_user(username=f'listener_{i}') for i in range(4)
+        ]
+        feedback_ids = []
+        for number, listener in enumerate(listeners, 1):
+            submission = self.client.post(reverse('feedback'), {
+                'track_id': self.track.id, 'comment': f'Private comment {number}',
+            }, format='json', HTTP_X_USER_ID=str(listener.id))
+            self.assertEqual(submission.status_code, 201)
+            feedback_ids.append(submission.data['feedback_id'])
+            summary = self.client.get(summary_url, **creator_headers)
+            self.assertEqual(summary.status_code, 200)
+            self.assertEqual(summary.data['feedback_count'], number)
+            self.assertEqual(summary.data['can_unlock'], number == 5)
+            self.assertEqual(summary.data['comments'], [
+                {'id': feedback_id, 'unlocked': False} for feedback_id in feedback_ids
+            ])
+            self.assertEqual(self.client.get(reverse('chats'), **chat_headers).data, [])
+            self.assertEqual(ChatMessage.objects.count(), 0)
+            if number == 1:
+                early = self.client.post(
+                    reverse('unlock_feedback', args=[feedback_ids[0]]),
+                    {'confirm': True}, format='json', **creator_headers,
+                )
+                self.assertEqual(early.status_code, 409)
+
+        unlock_url = reverse('unlock_feedback', args=[feedback_ids[0]])
+        self.assertEqual(self.client.post(unlock_url, {'confirm': True},
+            format='json', **listener_headers).status_code, 403)
+        self.assertEqual(self.client.post(unlock_url, {'confirm': True},
+            format='json', **chat_headers).status_code, 401)
+        self.assertEqual(self.client.post(unlock_url, {'confirm': False},
+            format='json', **creator_headers).status_code, 400)
+
+        unlocked = self.client.post(unlock_url, {'confirm': True},
+            format='json', **creator_headers)
+        self.assertEqual(unlocked.status_code, 200)
+        self.assertEqual(unlocked.data['payment'], {
+            'simulated': True, 'amount_cents': 499, 'currency': 'EUR',
+        })
+        self.assertFalse(unlocked.data['already_unlocked'])
+        repeated = self.client.post(unlock_url, {'confirm': True},
+            format='json', **creator_headers)
+        self.assertEqual(repeated.status_code, 200)
+        self.assertTrue(repeated.data['already_unlocked'])
+        self.assertEqual(repeated.data['message_id'], unlocked.data['message_id'])
+
+        chats = self.client.get(reverse('chats'), **chat_headers).data
+        self.assertEqual([room['last_message'] for room in chats], ['Private comment 1'])
+        messages = self.client.get(reverse('chat_messages',
+            args=[unlocked.data['chat_room_id']]), **chat_headers).data
+        self.assertEqual([message['content'] for message in messages], ['Private comment 1'])
+        self.assertFalse(messages[0]['is_blockchain_written'])
+        self.assertEqual(ChatMessage.objects.count(), 1)
+        summary = self.client.get(summary_url, **creator_headers)
+        self.assertEqual([item['unlocked'] for item in summary.data['comments']],
+            [True, False, False, False, False])
