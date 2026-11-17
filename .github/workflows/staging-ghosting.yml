@@ -1,0 +1,41 @@
+name: Woofery staging ghosting
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: woofery-staging-ghosting
+  cancel-in-progress: false
+
+jobs:
+  process-ghosting-reports:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: f45053a921591e09884998078d543d03794b92c6
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install backend dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Process expired reports in staging
+        env:
+          STAGING_DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+        run: |
+          if [ -z "$STAGING_DATABASE_URL" ]; then
+            echo '::error::The STAGING_DATABASE_URL secret is required.'
+            exit 1
+          fi
+          DATABASE_URL="$STAGING_DATABASE_URL" python manage.py process_ghosting_reports
