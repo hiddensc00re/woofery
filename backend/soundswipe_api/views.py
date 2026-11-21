@@ -2,7 +2,7 @@ from datetime import timedelta
 import os
 import hashlib
 from django.shortcuts import render, get_object_or_404
-from rest_framework.decorators import api_view, parser_classes
+from rest_framework.decorators import api_view, authentication_classes, parser_classes
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
@@ -12,6 +12,7 @@ from django.contrib.auth.models import User
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
+from .authentication import BearerAuthentication
 from .feedback_payouts import record_feedback_payout
 from .models import (
     ChatMessage, ChatRoom, Feedback, FeedbackPayout, GhostingReport, SavedTrack, Track, UserProfile,
@@ -58,6 +59,16 @@ def login_user(request):
         })
     else:
         return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
+
+@api_view(['POST'])
+@authentication_classes([BearerAuthentication])
+def logout_user(request):
+    if not request.user.is_authenticated:
+        return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
+
+    Token.objects.filter(pk=request.auth.pk).delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
 
 @api_view(['GET', 'POST'])
 @parser_classes([MultiPartParser, FormParser])

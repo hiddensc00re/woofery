@@ -73,6 +73,8 @@ function App() {
   const [passwordInput, setPasswordInput] = useState('');
   const [roleInput, setRoleInput] = useState('listener'); // 'listener' or 'creator'
   const [authError, setAuthError] = useState('');
+  const [logoutError, setLogoutError] = useState('');
+  const [loggingOut, setLoggingOut] = useState(false);
 
   // Upload Form Inputs
   const [uploadTrackName, setUploadTrackName] = useState('');
@@ -234,7 +236,24 @@ function App() {
   };
 
   // Handle Logout
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    setLoggingOut(true);
+    setLogoutError('');
+    try {
+      const response = await fetch(`${API_BASE}/logout/`, {
+        method: 'POST',
+        headers: getHeaders(false),
+      });
+      if (!response.ok && response.status !== 401) {
+        throw new Error('Logout failed');
+      }
+    } catch {
+      setLogoutError('Could not sign out. Please try again.');
+      return;
+    } finally {
+      setLoggingOut(false);
+    }
+
     setUser(null);
     localStorage.removeItem('soundswipe_user');
     setCurrentTab('swipe');
@@ -609,11 +628,13 @@ function App() {
               {user.role === 'creator' ? 'Artist' : 'Listener'}: @{user.username}
             </div>
             <button 
-              onClick={handleLogout} 
+              onClick={handleLogout}
+              disabled={loggingOut}
               style={{ background: 'none', border: 'none', color: '#ec4899', fontSize: '11px', cursor: 'pointer', fontWeight: 'bold' }}
             >
-              LOGOUT
+              {loggingOut ? 'SIGNING OUT…' : 'LOGOUT'}
             </button>
+            {logoutError && <span role="alert">{logoutError}</span>}
           </div>
         ) : (
           <button className="btn-pulse" style={{ padding: '6px 14px', fontSize: '12px' }} onClick={() => { setAuthMode('login'); setShowAuthModal(true); }}>

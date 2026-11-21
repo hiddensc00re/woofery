@@ -55,6 +55,23 @@ class SoundSwipeAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['role'], 'creator')
 
+    def test_logout_revokes_the_same_token_on_the_server(self):
+        headers = self.feedback_auth_headers(self.listener)
+        creator_headers = self.feedback_auth_headers(self.creator)
+        deck = reverse('deck')
+        logout = reverse('logout')
+
+        self.assertEqual(self.client.post(logout).status_code, 401)
+        self.assertEqual(self.client.get(deck, **headers).status_code, 200)
+        self.assertEqual(self.client.post(logout, **headers).status_code, 204)
+        self.assertEqual(self.client.get(deck, **headers).status_code, 401)
+        self.assertEqual(self.client.get(deck, **creator_headers).status_code, 200)
+
+        new_headers = self.feedback_auth_headers(self.listener)
+        self.assertNotEqual(new_headers, headers)
+        self.assertEqual(self.client.get(deck, **new_headers).status_code, 200)
+        self.assertEqual(self.client.get(deck, **headers).status_code, 401)
+
     def test_get_swipe_deck(self):
         url = reverse('deck')
         # Call without auth headers -> should fail
