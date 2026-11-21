@@ -5,6 +5,7 @@ urlpatterns = [
     path('', views.api_root, name='api_root'),
     path('register/', views.register_user, name='register'),
     path('login/', views.login_user, name='login'),
+    path('logout/', views.logout_user, name='logout'),
     path('tracks/', views.track_list_create, name='tracks'),
     path('deck/', views.get_swipe_deck, name='deck'),
     path('tracks/<int:track_id>/feedback/', views.track_feedback, name='track_feedback'),

@@ -12,7 +12,8 @@ function App() {
   // Authentication & Session
   const [user, setUser] = useState(() => {
     const saved = localStorage.getItem('soundswipe_user');
-    return saved ? JSON.parse(saved) : null;
+    const session = saved ? JSON.parse(saved) : null;
+    return session?.auth_token ? session : null;
   });
   
   // UI Navigation
@@ -72,6 +73,8 @@ function App() {
   const [passwordInput, setPasswordInput] = useState('');
   const [roleInput, setRoleInput] = useState('listener'); // 'listener' or 'creator'
   const [authError, setAuthError] = useState('');
+  const [logoutError, setLogoutError] = useState('');
+  const [loggingOut, setLoggingOut] = useState(false);
 
   // Upload Form Inputs
   const [uploadTrackName, setUploadTrackName] = useState('');
@@ -86,13 +89,10 @@ function App() {
   const [contractActive, setContractActive] = useState(false);
 
   // Headers helper
-  const getHeaders = () => {
-    const headers = { 'Content-Type': 'application/json' };
-    if (user) {
-      headers['X-User-ID'] = String(user.user_id);
-      if (user.feedback_token) {
-        headers.Authorization = `Bearer ${user.feedback_token}`;
-      }
+  const getHeaders = (json = true) => {
+    const headers = json ? { 'Content-Type': 'application/json' } : {};
+    if (user?.auth_token) {
+      headers.Authorization = `Bearer ${user.auth_token}`;
     }
     return headers;
   };
@@ -236,7 +236,24 @@ function App() {
   };
 
   // Handle Logout
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    setLoggingOut(true);
+    setLogoutError('');
+    try {
+      const response = await fetch(`${API_BASE}/logout/`, {
+        method: 'POST',
+        headers: getHeaders(false),
+      });
+      if (!response.ok && response.status !== 401) {
+        throw new Error('Logout failed');
+      }
+    } catch {
+      setLogoutError('Could not sign out. Please try again.');
+      return;
+    } finally {
+      setLoggingOut(false);
+    }
+
     setUser(null);
     localStorage.removeItem('soundswipe_user');
     setCurrentTab('swipe');
@@ -353,7 +370,6 @@ function App() {
     setCreatorFeedbackError('');
     setLoadingCreatorFeedback(true);
     try {
-      if (!user.feedback_token) throw new Error('Sign out and sign in again to view feedback.');
       const tracksResponse = await fetch(`${API_BASE}/tracks/`, { headers: getHeaders() });
       if (!tracksResponse.ok) throw new Error('Could not load your tracks.');
       const tracks = await tracksResponse.json();
@@ -508,9 +524,7 @@ function App() {
     try {
       const res = await fetch(`${API_BASE}/tracks/`, {
         method: 'POST',
-        headers: {
-          'X-User-ID': String(user.user_id)
-        },
+        headers: getHeaders(false),
         body: formData
       });
       if (res.ok) {
@@ -614,11 +628,13 @@ function App() {
               {user.role === 'creator' ? 'Artist' : 'Listener'}: @{user.username}
             </div>
             <button 
-              onClick={handleLogout} 
+              onClick={handleLogout}
+              disabled={loggingOut}
               style={{ background: 'none', border: 'none', color: '#ec4899', fontSize: '11px', cursor: 'pointer', fontWeight: 'bold' }}
             >
-              LOGOUT
+              {loggingOut ? 'SIGNING OUT…' : 'LOGOUT'}
             </button>
+            {logoutError && <span role="alert">{logoutError}</span>}
           </div>
         ) : (
           <button className="btn-pulse" style={{ padding: '6px 14px', fontSize: '12px' }} onClick={() => { setAuthMode('login'); setShowAuthModal(true); }}>

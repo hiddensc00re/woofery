@@ -2,35 +2,21 @@ from datetime import timedelta
 import os
 import hashlib
 from django.shortcuts import render, get_object_or_404
-from rest_framework.decorators import api_view, parser_classes
+from rest_framework.decorators import api_view, authentication_classes, parser_classes
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.contrib.auth import authenticate
-from django.core import signing
+from rest_framework.authtoken.models import Token
 from django.contrib.auth.models import User
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
+from .authentication import BearerAuthentication, get_login_token
 from .feedback_payouts import record_feedback_payout
 from .models import (
     ChatMessage, ChatRoom, Feedback, FeedbackPayout, GhostingReport, SavedTrack, Track, UserProfile,
 )
-
-def get_user_from_request(request):
-    """
-    Helper to get user from session, token, or X-User-ID header for easy frontend integration.
-    """
-    if request.user.is_authenticated:
-        return request.user
-    
-    user_id = request.headers.get('X-User-ID')
-    if user_id:
-        try:
-            return User.objects.get(id=int(user_id))
-        except (ValueError, User.DoesNotExist):
-            pass
-    return None
 
 @api_view(['POST'])
 def register_user(request):
@@ -51,7 +37,7 @@ def register_user(request):
         'user_id': user.id,
         'username': user.username,
         'role': profile.role,
-        'feedback_token': signing.dumps(user.id, salt='feedback-api'),
+        'auth_token': get_login_token(user).key,
     }, status=status.HTTP_201_CREATED)
 
 @api_view(['POST'])
@@ -69,16 +55,26 @@ def login_user(request):
             'user_id': user.id,
             'username': user.username,
             'role': profile.role,
-            'feedback_token': signing.dumps(user.id, salt='feedback-api'),
+            'auth_token': get_login_token(user).key,
         })
     else:
         return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
 
+@api_view(['POST'])
+@authentication_classes([BearerAuthentication])
+def logout_user(request):
+    if not request.user.is_authenticated:
+        return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
+
+    Token.objects.filter(pk=request.auth.pk).delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 @api_view(['GET', 'POST'])
 @parser_classes([MultiPartParser, FormParser])
 def track_list_create(request):
-    user = get_user_from_request(request)
-    if not user:
+    user = request.user
+    if not user.is_authenticated:
         return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
 
     if request.method == 'POST':
@@ -143,8 +139,8 @@ def track_list_create(request):
 
 @api_view(['GET'])
 def get_swipe_deck(request):
-    user = get_user_from_request(request)
-    if not user:
+    user = request.user
+    if not user.is_authenticated:
         return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
         
     commented_track_ids = Feedback.objects.filter(listener=user).values_list('track_id', flat=True)
@@ -168,8 +164,8 @@ def get_swipe_deck(request):
 @api_view(['POST'])
 @transaction.atomic
 def submit_feedback(request):
-    user = get_user_from_request(request)
-    if not user:
+    user = request.user
+    if not user.is_authenticated:
         return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
         
     track_id = request.data.get('track_id')
@@ -211,24 +207,11 @@ def submit_feedback(request):
         'track_active': track.is_active
     }, status=status.HTTP_201_CREATED)
 
-def get_feedback_api_user(request):
-    if request.user.is_authenticated:
-        return request.user
-    scheme, _, token = request.headers.get('Authorization', '').partition(' ')
-    if scheme.lower() != 'bearer' or not token:
-        return None
-    try:
-        user_id = signing.loads(token, salt='feedback-api', max_age=3600)
-    except signing.BadSignature:
-        return None
-    return User.objects.filter(pk=user_id, is_active=True).first()
-
-
 @api_view(['GET', 'POST'])
 @transaction.atomic
 def track_feedback(request, track_id):
-    user = get_feedback_api_user(request)
-    if not user:
+    user = request.user
+    if not user.is_authenticated:
         return Response({'error': 'Authentication required'}, status=401)
     tracks = Track.objects.select_for_update() if request.method == 'POST' else Track.objects.all()
     track = get_object_or_404(tracks, pk=track_id)
@@ -262,8 +245,8 @@ def track_feedback(request, track_id):
 @api_view(['POST'])
 @transaction.atomic
 def unlock_feedback(request, feedback_id):
-    user = get_feedback_api_user(request)
-    if not user:
+    user = request.user
+    if not user.is_authenticated:
         return Response({'error': 'Authentication required'}, status=401)
     feedback = get_object_or_404(Feedback, pk=feedback_id)
     track = get_object_or_404(Track.objects.select_for_update(), pk=feedback.track_id)
@@ -298,8 +281,8 @@ def unlock_feedback(request, feedback_id):
 
 @api_view(['GET', 'POST'])
 def chat_rooms_list(request):
-    user = get_user_from_request(request)
-    if not user:
+    user = request.user
+    if not user.is_authenticated:
         return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
         
     if request.method == 'GET':
@@ -325,8 +308,8 @@ def chat_rooms_list(request):
 @api_view(['POST'])
 @transaction.atomic
 def report_ghosting(request, room_id):
-    user = get_feedback_api_user(request)
-    if not user:
+    user = request.user
+    if not user.is_authenticated:
         return Response({'error': 'Authentication required'}, status=401)
 
     room = get_object_or_404(ChatRoom.objects.select_for_update(), pk=room_id)
@@ -350,8 +333,8 @@ def report_ghosting(request, room_id):
 @api_view(['POST'])
 @transaction.atomic
 def close_chat(request, room_id):
-    user = get_feedback_api_user(request)
-    if not user:
+    user = request.user
+    if not user.is_authenticated:
         return Response({'error': 'Authentication required'}, status=401)
 
     room = get_object_or_404(ChatRoom.objects.select_for_update(), pk=room_id)
@@ -385,8 +368,8 @@ def close_chat(request, room_id):
 @api_view(['GET', 'POST'])
 @transaction.atomic
 def chat_messages(request, room_id):
-    user = get_user_from_request(request)
-    if not user:
+    user = request.user
+    if not user.is_authenticated:
         return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
         
     try:
@@ -439,8 +422,8 @@ def chat_messages(request, room_id):
 
 @api_view(['POST'])
 def blockchain_consent(request, message_id):
-    user = get_user_from_request(request)
-    if not user:
+    user = request.user
+    if not user.is_authenticated:
         return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
         
     try:
@@ -455,6 +438,8 @@ def blockchain_consent(request, message_id):
     action = request.data.get('action')
     
     if action == 'request':
+        if msg.sender_id != user.id:
+            return Response({'error': 'Only the sender can request blockchain consent'}, status=403)
         msg.is_blockchain_pending = True
         msg.save()
         return Response({
@@ -464,6 +449,8 @@ def blockchain_consent(request, message_id):
         })
         
     elif action == 'approve':
+        if msg.sender_id == user.id:
+            return Response({'error': 'Only the recipient can approve blockchain consent'}, status=403)
         if not msg.is_blockchain_pending:
             return Response({'error': 'No blockchain request pending for this message'}, status=status.HTTP_400_BAD_REQUEST)
             
@@ -487,8 +474,8 @@ def blockchain_consent(request, message_id):
 
 @api_view(['GET', 'POST', 'DELETE'])
 def saved_tracks_view(request):
-    user = get_user_from_request(request)
-    if not user:
+    user = request.user
+    if not user.is_authenticated:
         return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
         
     if request.method == 'GET':
