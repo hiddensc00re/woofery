@@ -6,6 +6,7 @@ from django.core.management import call_command
 from django.contrib.auth.models import User
 from django.urls import reverse
 from rest_framework import status
+from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 from .models import ChatMessage, ChatRoom, Feedback, FeedbackPayout, GhostingReport, Track, UserProfile
 
@@ -60,23 +61,15 @@ class SoundSwipeAPITests(APITestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
         
-        # Call with X-User-ID header
-        response = self.client.get(url, HTTP_X_USER_ID=str(self.listener.id))
+        response = self.client.get(url, **self.feedback_auth_headers(self.listener))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]['track_name'], 'Test Track')
 
     def test_feedback_unlock_lifecycle(self):
-        def authenticate_for_feedback(user):
-            login = self.client.post(reverse('login'), {
-                'username': user.username, 'password': 'password123',
-            }, format='json')
-            self.assertEqual(login.status_code, 200)
-            return {'HTTP_AUTHORIZATION': 'Bearer ' + login.data['feedback_token']}
-
-        creator_headers = authenticate_for_feedback(self.creator)
-        listener_headers = authenticate_for_feedback(self.listener)
-        chat_headers = {'HTTP_X_USER_ID': str(self.creator.id)}
+        creator_headers = self.feedback_auth_headers(self.creator)
+        listener_headers = self.feedback_auth_headers(self.listener)
+        chat_headers = creator_headers
         summary_url = reverse('track_feedback', args=[self.track.id])
         listeners = [self.listener] + [
             User.objects.create_user(username=f'listener_{i}') for i in range(4)
@@ -85,7 +78,7 @@ class SoundSwipeAPITests(APITestCase):
         for number, listener in enumerate(listeners, 1):
             submission = self.client.post(reverse('feedback'), {
                 'track_id': self.track.id, 'comment': f'Private comment {number}',
-            }, format='json', HTTP_X_USER_ID=str(listener.id))
+            }, format='json', **self.fixture_auth_headers(listener))
             self.assertEqual(submission.status_code, 201)
             feedback_ids.append(submission.data['feedback_id'])
             summary = self.client.get(summary_url, **creator_headers)
@@ -107,7 +100,7 @@ class SoundSwipeAPITests(APITestCase):
             self.assertEqual(self.client.post(unlock_url, {'confirm': True},
                 format='json', **listener_headers).status_code, 403)
             self.assertEqual(self.client.post(unlock_url, {'confirm': True},
-                format='json', **chat_headers).status_code, 401)
+                format='json', HTTP_X_USER_ID=str(self.creator.id)).status_code, 401)
             self.assertEqual(self.client.post(unlock_url, {'confirm': False},
                 format='json', **creator_headers).status_code, 400)
 
@@ -142,17 +135,11 @@ class SoundSwipeAPITests(APITestCase):
             [True, False, False, False, False])
 
     def test_only_owner_can_decline_full_locked_feedback(self):
-        def sign_in(username):
-            response = self.client.post(reverse('login'), {
-                'username': username, 'password': 'password123',
-            }, format='json')
-            return {'HTTP_AUTHORIZATION': 'Bearer ' + response.data['feedback_token']}
-
-        owner = sign_in(self.creator.username)
-        listener = sign_in(self.listener.username)
+        owner = self.feedback_auth_headers(self.creator)
+        listener = self.feedback_auth_headers(self.listener)
         other_creator = User.objects.create_user('other_creator', password='password123')
         UserProfile.objects.create(user=other_creator, role='creator')
-        other = sign_in(other_creator.username)
+        other = self.feedback_auth_headers(other_creator)
         url = reverse('track_feedback', args=[self.track.id])
 
         self.assertEqual(self.client.post(url, **owner).status_code, 409)
@@ -163,7 +150,7 @@ class SoundSwipeAPITests(APITestCase):
         for index, account in enumerate(listeners):
             response = self.client.post(reverse('feedback'), {
                 'track_id': self.track.id, 'comment': f'Locked advice {index}',
-            }, format='json', HTTP_X_USER_ID=str(account.id))
+            }, format='json', **self.fixture_auth_headers(account))
             self.assertEqual(response.status_code, 201)
             feedback_ids.append(response.data['feedback_id'])
 
@@ -186,7 +173,7 @@ class SoundSwipeAPITests(APITestCase):
             unlock = self.client.post(reverse('unlock_feedback', args=[feedback_id]),
                 {'confirm': True}, format='json', **owner)
             self.assertEqual(unlock.status_code, 409)
-        self.assertEqual(self.client.get(reverse('chats'), **legacy_owner).data, [])
+        self.assertEqual(self.client.get(reverse('chats'), **owner).data, [])
         self.assertFalse(ChatRoom.objects.exists())
         self.assertFalse(ChatMessage.objects.exists())
         self.assertFalse(FeedbackPayout.objects.exists())
@@ -241,7 +228,7 @@ class SoundSwipeAPITests(APITestCase):
         self.assertEqual((payout.amount_cents, payout.currency), (100, 'EUR'))
 
         for participant in (self.creator, self.listener):
-            headers = {'HTTP_X_USER_ID': str(participant.id)}
+            headers = self.feedback_auth_headers(participant)
             send = self.client.post(messages_url, {'content': 'Follow-up'},
                 format='json', **headers)
             self.assertEqual(send.status_code, 409)
@@ -267,12 +254,12 @@ class SoundSwipeAPITests(APITestCase):
         response = self.client.post(reverse('login'),
             {'username': user.username, 'password': 'password123'}, format='json')
         self.assertEqual(response.status_code, 200)
-        return {'HTTP_AUTHORIZATION': 'Bearer ' + response.data['feedback_token']}
+        return {'HTTP_AUTHORIZATION': 'Bearer ' + response.data['auth_token']}
 
     def make_unlocked_feedback(self, review):
         submitted = self.client.post(reverse('feedback'),
             {'track_id': self.track.id, 'comment': 'Try adjusting the snare.'},
-            format='json', HTTP_X_USER_ID=str(self.listener.id))
+            format='json', **self.feedback_auth_headers(self.listener))
         self.assertEqual(submitted.status_code, 201)
         feedback = Feedback.objects.get(pk=submitted.data['feedback_id'])
         feedback.grammar_review = review
@@ -313,7 +300,7 @@ class SoundSwipeAPITests(APITestCase):
             self.assertEqual(self.client.post(url, **listener).status_code, 409)
             Feedback.objects.filter(pk=feedback.pk).update(chat_message_id=message_id)
             reply = self.client.post(reverse('chat_messages', args=[room_id]), {'content': 'Thanks'},
-                format='json', HTTP_X_USER_ID=str(self.creator.id))
+                format='json', **self.feedback_auth_headers(self.creator))
             self.assertEqual(reply.status_code, 201)
             self.assertEqual(self.client.post(url, **listener).status_code, 409)
             room.messages.filter(pk=reply.data['id']).delete()
@@ -330,7 +317,7 @@ class SoundSwipeAPITests(APITestCase):
             deadline = self.report_ghosting_deadline(room_id)
             clock.return_value = deadline - timedelta(seconds=1)
             reply = self.client.post(reverse('chat_messages', args=[room_id]), {'content': 'Thanks'},
-                format='json', HTTP_X_USER_ID=str(self.creator.id))
+                format='json', **self.feedback_auth_headers(self.creator))
             self.assertEqual(reply.status_code, 201)
             clock.return_value = deadline
             call_command('process_ghosting_reports', stdout=StringIO())
@@ -389,7 +376,7 @@ class SoundSwipeAPITests(APITestCase):
             feedback, room_id = self.make_unlocked_feedback(Feedback.GrammarReview.PASSED)
             clock.return_value = self.report_ghosting_deadline(room_id) + timedelta(seconds=1)
             reply = self.client.post(reverse('chat_messages', args=[room_id]), {'content': 'Thanks'},
-                format='json', HTTP_X_USER_ID=str(self.creator.id))
+                format='json', **self.feedback_auth_headers(self.creator))
             self.assertEqual(reply.status_code, 201)
             call_command('process_ghosting_reports', stdout=StringIO())
             self.assertEqual(FeedbackPayout.objects.get(feedback=feedback).amount_cents, 100)
@@ -399,3 +386,61 @@ class SoundSwipeAPITests(APITestCase):
             **self.feedback_auth_headers(self.listener))
         self.assertEqual(response.status_code, 201)
         return response.data['deadline']
+
+    def fixture_auth_headers(self, user):
+        token, _ = Token.objects.get_or_create(user=user)
+        return {'HTTP_AUTHORIZATION': 'Bearer ' + token.key}
+
+    def test_client_supplied_identity_cannot_override_authentication(self):
+        feedback, room_id = self.make_unlocked_feedback(Feedback.GrammarReview.PASSED)
+        owner_id = str(self.creator.pk)
+        messages = reverse('chat_messages', args=[room_id])
+        close = reverse('close_chat', args=[room_id])
+        report = reverse('report_ghosting', args=[room_id])
+        unlock = reverse('unlock_feedback', args=[feedback.pk])
+        summary = reverse('track_feedback', args=[self.track.pk])
+        consent = reverse('blockchain_consent', args=[feedback.chat_message_id])
+        for method, url in (
+            ('get', reverse('tracks')), ('get', reverse('deck')), ('get', reverse('saved_tracks')),
+            ('post', reverse('feedback')), ('get', reverse('chats')),
+            ('get', messages), ('post', messages), ('post', close), ('post', report),
+            ('post', unlock), ('get', summary), ('post', summary), ('post', consent),
+        ):
+            with self.subTest(method=method, url=url):
+                request = getattr(self.client, method)
+                self.assertEqual(request(url, HTTP_X_USER_ID=owner_id).status_code, 401)
+
+        self.assertEqual(self.client.get(messages, HTTP_AUTHORIZATION='Bearer invalid',
+            HTTP_X_USER_ID=owner_id).status_code, 401)
+        outsider = User.objects.create_user('identity_outsider')
+        headers = {**self.fixture_auth_headers(outsider), 'HTTP_X_USER_ID': owner_id}
+        self.assertEqual(self.client.get(messages, **headers).status_code, 403)
+        self.assertEqual(self.client.post(messages, {'content': 'Outsider'},
+            format='json', **headers).status_code, 403)
+        self.assertEqual(self.client.post(consent, {'action': 'request'},
+            format='json', **headers).status_code, 403)
+
+        listener = {**self.feedback_auth_headers(self.listener), 'HTTP_X_USER_ID': owner_id}
+        for url, payload in (
+            (unlock, {'confirm': True}), (summary, {}), (close, {'reason': 'comment_not_helpful'}),
+        ):
+            self.assertEqual(self.client.post(url, {**payload, 'user_id': owner_id},
+                format='json', **listener).status_code, 403)
+        self.assertEqual(self.client.post(report, **listener).status_code, 201)
+        reply = self.client.post(messages, {'content': 'Listener follow-up', 'sender_id': owner_id},
+            format='json', **listener)
+        self.assertEqual(reply.status_code, 201)
+        self.assertEqual(reply.data['sender_id'], self.listener.pk)
+
+        owner = {**self.feedback_auth_headers(self.creator), 'HTTP_X_USER_ID': str(self.listener.pk)}
+        self.assertEqual(self.client.post(report, **owner).status_code, 403)
+        self.assertEqual(self.client.post(consent, {'action': 'request'},
+            format='json', **owner).status_code, 403)
+        self.assertEqual(self.client.post(consent, {'action': 'request'},
+            format='json', **listener).status_code, 200)
+        self.assertEqual(self.client.post(consent, {'action': 'approve'},
+            format='json', **listener).status_code, 403)
+        self.assertEqual(self.client.post(consent, {'action': 'approve'},
+            format='json', **owner).status_code, 200)
+        self.assertEqual(self.client.post(close, {'reason': 'comment_not_helpful'},
+            format='json', **owner).status_code, 200)

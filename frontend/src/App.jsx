@@ -12,7 +12,8 @@ function App() {
   // Authentication & Session
   const [user, setUser] = useState(() => {
     const saved = localStorage.getItem('soundswipe_user');
-    return saved ? JSON.parse(saved) : null;
+    const session = saved ? JSON.parse(saved) : null;
+    return session?.auth_token ? session : null;
   });
   
   // UI Navigation
@@ -86,13 +87,10 @@ function App() {
   const [contractActive, setContractActive] = useState(false);
 
   // Headers helper
-  const getHeaders = () => {
-    const headers = { 'Content-Type': 'application/json' };
-    if (user) {
-      headers['X-User-ID'] = String(user.user_id);
-      if (user.feedback_token) {
-        headers.Authorization = `Bearer ${user.feedback_token}`;
-      }
+  const getHeaders = (json = true) => {
+    const headers = json ? { 'Content-Type': 'application/json' } : {};
+    if (user?.auth_token) {
+      headers.Authorization = `Bearer ${user.auth_token}`;
     }
     return headers;
   };
@@ -353,7 +351,6 @@ function App() {
     setCreatorFeedbackError('');
     setLoadingCreatorFeedback(true);
     try {
-      if (!user.feedback_token) throw new Error('Sign out and sign in again to view feedback.');
       const tracksResponse = await fetch(`${API_BASE}/tracks/`, { headers: getHeaders() });
       if (!tracksResponse.ok) throw new Error('Could not load your tracks.');
       const tracks = await tracksResponse.json();
@@ -508,9 +505,7 @@ function App() {
     try {
       const res = await fetch(`${API_BASE}/tracks/`, {
         method: 'POST',
-        headers: {
-          'X-User-ID': String(user.user_id)
-        },
+        headers: getHeaders(false),
         body: formData
       });
       if (res.ok) {
