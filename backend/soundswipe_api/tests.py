@@ -55,6 +55,25 @@ class SoundSwipeAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['role'], 'creator')
 
+    def test_bearer_token_expires_after_one_hour_and_login_replaces_it(self):
+        issued_at = datetime(2026, 11, 21, 12, tzinfo=timezone.utc)
+        deck = reverse('deck')
+        with patch('django.utils.timezone.now', return_value=issued_at) as clock:
+            headers = self.feedback_auth_headers(self.listener)
+
+            clock.return_value = issued_at + timedelta(minutes=59, seconds=59)
+            self.assertEqual(self.client.get(deck, **headers).status_code, 200)
+
+            clock.return_value = issued_at + timedelta(hours=1)
+            expired = self.client.get(deck, **headers)
+            self.assertEqual(expired.status_code, 401)
+            self.assertEqual(expired.data['detail'], 'Token has expired')
+
+            new_headers = self.feedback_auth_headers(self.listener)
+            self.assertNotEqual(new_headers, headers)
+            self.assertEqual(self.client.get(deck, **new_headers).status_code, 200)
+            self.assertEqual(self.client.get(deck, **headers).status_code, 401)
+
     def test_logout_revokes_the_same_token_on_the_server(self):
         headers = self.feedback_auth_headers(self.listener)
         creator_headers = self.feedback_auth_headers(self.creator)

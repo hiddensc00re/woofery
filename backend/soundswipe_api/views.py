@@ -12,7 +12,7 @@ from django.contrib.auth.models import User
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
-from .authentication import BearerAuthentication
+from .authentication import BearerAuthentication, get_login_token
 from .feedback_payouts import record_feedback_payout
 from .models import (
     ChatMessage, ChatRoom, Feedback, FeedbackPayout, GhostingReport, SavedTrack, Track, UserProfile,
@@ -37,7 +37,7 @@ def register_user(request):
         'user_id': user.id,
         'username': user.username,
         'role': profile.role,
-        'auth_token': Token.objects.get_or_create(user=user)[0].key,
+        'auth_token': get_login_token(user).key,
     }, status=status.HTTP_201_CREATED)
 
 @api_view(['POST'])
@@ -55,7 +55,7 @@ def login_user(request):
             'user_id': user.id,
             'username': user.username,
             'role': profile.role,
-            'auth_token': Token.objects.get_or_create(user=user)[0].key,
+            'auth_token': get_login_token(user).key,
         })
     else:
         return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
